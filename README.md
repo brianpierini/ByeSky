@@ -1,6 +1,6 @@
 # ByeSky
 
-A CLI tool to delete or preview BlueSky posts older than a specified number of days, with advanced filtering, backup, and automation options.
+ByeSky is a CLI tool to delete BlueSky posts older than a specified number of days, with advanced filtering, backup, preview and automation options.
 
 ## Features
 
@@ -9,6 +9,17 @@ A CLI tool to delete or preview BlueSky posts older than a specified number of d
 - Cron job friendly
 - Advanced filtering (date, keyword, regex, replies, reposts)
 - Backup deleted posts
+
+## Disclaimer
+
+**Warning:** This tool performs irreversible data deletion. Use with caution.  
+Double-check your filters and options before running by using `--preview`.  
+
+**The `--preview` option will only show what would be deleted and will NOT delete any posts.**  
+
+**The `--no-preview` option will actually delete the matching posts.**  
+
+The author is **not responsible** for any data loss or unintended consequences.
 
 ## Installation
 
