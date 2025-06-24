@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.env
+.DS_Store
+*.log
+deleted_posts_backup.jsonl
+preview_log.txt
+deleted_posts_log.txt
+my_backup.jsonl
