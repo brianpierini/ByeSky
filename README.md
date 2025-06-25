@@ -2,6 +2,10 @@
 
 ByeSky is a CLI tool to delete BlueSky posts older than a specified number of days, with advanced filtering, backup, preview and automation options.
 
+## Motivation
+
+I believe that opinions change, trends fade, and not every thought or post needs to live online forever. As someone who values privacy, I wanted a tool that empowers users to easily and safely clean up their BlueSky history giving them control over what remains public. ByeSky is designed to make it simple to review, filter, and remove old posts.
+
 ## Features
 
 - Export logs
@@ -31,6 +35,12 @@ The author is **not responsible** for any data loss or unintended consequences.
     ```
 
 2. [Create a BlueSky app password](https://bsky.app/settings/app-passwords).
+
+> **Note:**  
+> ByeSky is compatible with Pydantic v2 and newer.  
+> If you see errors about `.dict()`, upgrade Pydantic:  
+> `pip install --upgrade pydantic`  
+> Requires Python 3.8 or newer (recommended).
 
 ## Quick Start
 
@@ -159,6 +169,8 @@ python3 byesky.py [OPTIONS]
 
 - `--quiet`  
   Suppress most output except errors and summary.  
+  Progress bars are still shown in quiet mode.  
+  HTTP request logs are suppressed in quiet mode.  
   Example:  
   ```
   python3 byesky.py --handle johnappleseed@bsky.social --no-preview --quiet
@@ -175,10 +187,6 @@ python3 byesky.py --handle johnappleseed@bsky.social --token YOUR_APP_PASSWORD -
 ```zsh
 python3 byesky.py --handle johnappleseed@bsky.social --no-preview --after 2024-01-01 --include-replies --backup-file backup.jsonl
 ```
-
-## Automation (Cron)
-
-See `run_byesky.sh` for an example shell script to automate this tool with cron.
 
 ## Security
 

@@ -12,6 +12,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from dateutil import parser
 from atproto import Client, models
 
+__version__ = "0.1.0"
+
 # ─── Logging Setup ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -57,7 +59,11 @@ def process_posts(
     quiet=False
 ):
     client = Client()
-    client.login(handle, token)
+    try:
+        client.login(handle, token)
+    except Exception as e:
+        logger.error("Login failed: %s", e)
+        return {"scanned": 0, "matched": 0, "deleted": 0, "failed": 0}
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_old)
 
     # Parse after/before if provided
@@ -80,8 +86,9 @@ def process_posts(
 
     # Hide fetching pages progress bar in quiet mode
     page_bar_args = {"desc": "Fetching pages", "unit": "page"}
-    if quiet:
-        page_bar_args["disable"] = True
+    # Remove disabling in quiet mode
+    # if quiet:
+    #     page_bar_args["disable"] = True
 
     with tqdm(**page_bar_args) as page_bar:
         while True:
@@ -92,7 +99,8 @@ def process_posts(
                     pt = pt.astimezone(timezone.utc)
                 except Exception:
                     pt = pt.replace(tzinfo=timezone.utc)
-                record_dict = item.post.record.dict()
+                # Change .dict() to .model_dump()
+                record_dict = item.post.record.model_dump()
                 text = record_dict.get("text", "")
 
                 # Filter by cutoff, date range, and match patterns
@@ -145,37 +153,42 @@ def process_posts(
 
     deleted = failed = 0
     backup_fh = None
-    if not preview_only:
-        backup_fh = open(backup_file, "a", encoding="utf-8")
+    try:
+        if not preview_only:
+            backup_fh = open(backup_file, "a", encoding="utf-8")
 
-    # Only show the main progress bar if not quiet, otherwise disable it
-    post_bar_args = {"desc": "Processing posts", "unit": "post"}
-    if quiet:
-        post_bar_args["disable"] = False  # Show progress bar even in quiet mode
+        # Only show the main progress bar if not quiet, otherwise disable it
+        post_bar_args = {"desc": "Processing posts", "unit": "post"}
+        # Remove disabling in quiet mode
+        # if quiet:
+        #     post_bar_args["disable"] = True  # Show progress bar even in quiet mode
 
-    with open(log_file, "a", encoding="utf-8") as f, \
-         tqdm(posts, **post_bar_args) as post_bar:
-        for uri, post, pt in post_bar:
-            record_dict = post.record.dict()
-            text = record_dict.get("text", "")
-            text = text.replace("\n", " ")
-            f.write(f"{pt.strftime('%Y-%m-%d %H:%M:%S')} UTC  {text}\n---\n")
-            if not preview_only:
-                # Backup full post JSON before deletion
-                backup_fh.write(json.dumps({
-                    "uri": uri,
-                    "datetime": pt.isoformat(),
-                    "post": post.dict()
-                }, ensure_ascii=False) + "\n")
-                try:
-                    delete_record(client, handle, uri)
-                    deleted += 1
-                except Exception as e:
-                    logger.warning(f"Failed deleting {uri}: {e}")
-                    failed += 1
-            post_bar.update()
-    if backup_fh:
-        backup_fh.close()
+        with open(log_file, "a", encoding="utf-8") as f, \
+             tqdm(posts, **post_bar_args) as post_bar:
+            for uri, post, pt in post_bar:
+                # Change .dict() to .model_dump()
+                record_dict = post.record.model_dump()
+                text = record_dict.get("text", "")
+                text = text.replace("\n", " ")
+                f.write(f"{pt.strftime('%Y-%m-%d %H:%M:%S')} UTC  {text}\n---\n")
+                if not preview_only:
+                    # Backup full post JSON before deletion
+                    backup_fh.write(json.dumps({
+                        "uri": uri,
+                        "datetime": pt.isoformat(),
+                        # Change .dict() to .model_dump()
+                        "post": post.model_dump()
+                    }, ensure_ascii=False) + "\n")
+                    try:
+                        delete_record(client, handle, uri)
+                        deleted += 1
+                    except Exception as e:
+                        logger.warning(f"Failed deleting {uri}: {e}")
+                        failed += 1
+                post_bar.update()
+    finally:
+        if backup_fh:
+            backup_fh.close()
 
     return {
         "scanned": page_bar.n * 50,
@@ -189,6 +202,7 @@ def process_posts(
     help="Delete or preview BlueSky posts older than N days.\n\n"
          "SECURITY TIP: For automation, consider passing your app password via the BYESKY_TOKEN environment variable instead of the --token argument."
 )
+@click.version_option(__version__, "--version", message="ByeSky version %(version)s")
 @click.option("--handle", "-u", prompt="BlueSky handle", help="e.g. yourname.bsky.social")
 @click.option("--token", "-p", default=None, help="App password (16-char); will prompt if missing")
 @click.option("--days", "-d", default=30, show_default=True,
@@ -215,17 +229,32 @@ def cli(handle, token, days, preview, log_file, match, regex, after, before, bac
     else:
         logger.setLevel(logging.INFO)
 
+    # Prevent accidental deletion with low --days
+    if not preview and days < 1:
+        logger.error("Refusing to delete posts newer than 1 day. Use --days 1 or higher.")
+        sys.exit(2)
+
     # Control atproto_client HTTP request logs
     atproto_logger = logging.getLogger("atproto_client")
-    if verbose:
+    httpx_logger = logging.getLogger("httpx")
+    if quiet:
+        atproto_logger.setLevel(logging.ERROR)
+        httpx_logger.setLevel(logging.ERROR)
+    elif verbose:
         atproto_logger.setLevel(logging.DEBUG)
+        httpx_logger.setLevel(logging.DEBUG)
     else:
         atproto_logger.setLevel(logging.WARNING)
+        httpx_logger.setLevel(logging.WARNING)
 
     # Warn if token is passed via command line (visible in process list)
     if token and "BYESKY_TOKEN" not in os.environ:
         logger.warning("SECURITY: Passing the app password via --token exposes it in your process list. "
                        "For automation, set the BYESKY_TOKEN environment variable instead.")
+
+    # Mask token in logs (never print token)
+    token_masked = "*" * len(token) if token else None
+    logger.info(f"Using handle: {handle}, token: {token_masked}, days: {days}, preview: {preview}")
 
     # Prefer environment variable for token if available
     if not token:
@@ -233,15 +262,29 @@ def cli(handle, token, days, preview, log_file, match, regex, after, before, bac
     if not token:
         token = getpass.getpass("App password: ").strip()
 
-    result = process_posts(
-        handle, token, days, preview, log_file,
-        match_patterns=match, use_regex=regex,
-        after=after, before=before,
-        backup_file=backup_file,
-        include_replies=include_replies,
-        include_reposts=include_reposts,
-        quiet=quiet
-    )
+    # Confirm deletion unless preview or quiet
+    if not preview and not quiet:
+        click.confirm(
+            f"Are you sure you want to DELETE posts older than {days} days? This cannot be undone.",
+            abort=True
+        )
+
+    try:
+        result = process_posts(
+            handle, token, days, preview, log_file,
+            match_patterns=match, use_regex=regex,
+            after=after, before=before,
+            backup_file=backup_file,
+            include_replies=include_replies,
+            include_reposts=include_reposts,
+            quiet=quiet
+        )
+    except (OSError, IOError) as e:
+        logger.error(f"File error: {e}")
+        sys.exit(3)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(99)
 
     # Always show summary, even in quiet mode
     click.echo("\n── Summary ──────────────────────────")
@@ -250,6 +293,7 @@ def cli(handle, token, days, preview, log_file, match, regex, after, before, bac
     if not preview:
         click.echo(f" Posts deleted   : {result['deleted']}")
         click.echo(f" Delete failures : {result['failed']}")
+    # Mask password in summary/log output
     click.echo(f" Log file        : {log_file or ('preview_log.txt' if preview else 'deleted_posts_log.txt')}")
     click.echo("──────────────────────────────────────")
 
