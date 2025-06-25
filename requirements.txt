@@ -3,3 +3,4 @@ click
 tqdm
 tenacity
 python-dateutil
+pydantic>=2.0
