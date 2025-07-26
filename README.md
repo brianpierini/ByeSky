@@ -1,5 +1,7 @@
 # ByeSky
 
+![Demo of ByeSky in action](media/byesky_demo.gif)
+
 ByeSky is a CLI tool to delete BlueSky posts older than a specified number of days, with advanced filtering, backup, preview and automation options.
 
 ## Motivation
