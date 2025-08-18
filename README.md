@@ -29,14 +29,49 @@ The author is **not responsible** for any data loss or unintended consequences.
 
 ## Installation
 
-1. Clone this repo and install dependencies:
+1. Clone this repo:
     ```zsh
     git clone https://github.com/brianpierini/ByeSky.git
     cd ByeSky
-    pip install -r requirements.txt
     ```
 
 2. [Create a BlueSky app password](https://bsky.app/settings/app-passwords).
+
+### Option 1: Virtual Environment (Recommended)
+
+```zsh
+# Create a virtual environment
+python3 -m venv venv
+
+# Activate the virtual environment
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run ByeSky (make sure venv is activated)
+python byesky.py --handle yourhandle.bsky.social --days 30 --preview
+```
+
+### Option 2: Using pipx (macOS-friendly)
+
+```zsh
+# Install pipx (if not already installed)
+brew install pipx
+
+# Install ByeSky globally with pipx
+pipx install .
+
+# Run ByeSky
+byesky --handle yourhandle.bsky.social --days 30 --preview
+```
+
+### Option 3: Direct Installation (Not Recommended)
+
+```zsh
+# Install dependencies globally (may cause conflicts)
+pip3 install -r requirements.txt --break-system-packages
+```
 
 > **Note:**  
 > ByeSky is compatible with Pydantic v2 and newer.  
@@ -188,6 +223,97 @@ python3 byesky.py --handle johnappleseed@bsky.social --token YOUR_APP_PASSWORD -
 
 ```zsh
 python3 byesky.py --handle johnappleseed@bsky.social --no-preview --after 2024-01-01 --include-replies --backup-file backup.jsonl
+```
+
+## Troubleshooting
+
+### Common Error: `'NoneType' object is not callable`
+
+This error typically occurs due to one of these issues:
+
+#### 1. **Virtual Environment Not Activated**
+If you're not using a virtual environment, you need to activate it first:
+
+```bash
+# Make sure you're in the ByeSky directory
+cd /path/to/ByeSky
+
+# Activate the virtual environment
+source venv/bin/activate
+
+# You should see (venv) at the start of your prompt
+# Then run the script
+python byesky.py --handle yourhandle.bsky.social --days 30 --preview
+```
+
+#### 2. **Pydantic Version Compatibility**
+The most likely cause is an outdated Pydantic version:
+
+```bash
+# Make sure virtual environment is activated
+source venv/bin/activate
+
+# Upgrade Pydantic
+pip install --upgrade pydantic
+
+# Try again
+python byesky.py --handle yourhandle.bsky.social --days 30 --preview
+```
+
+#### 3. **Missing Dependencies**
+Some required packages might not be installed properly:
+
+```bash
+# Make sure virtual environment is activated
+source venv/bin/activate
+
+# Reinstall dependencies
+pip install -r requirements.txt
+```
+
+#### 4. **macOS Python Environment Issues**
+macOS has an externally managed Python environment. If you don't have a virtual environment:
+
+```bash
+# Create a virtual environment
+python3 -m venv venv
+
+# Activate it
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Test the script
+python byesky.py --help
+```
+
+#### 5. **Additional Debugging**
+If the error persists:
+
+- Run with `--verbose` flag to get more detailed error information:
+  ```bash
+  python byesky.py --handle yourhandle.bsky.social --days 30 --preview --verbose
+  ```
+- Check if you can access your BlueSky account normally
+- Try with a different handle or app password
+- Try with a smaller date range first:
+  ```bash
+  python byesky.py --handle yourhandle.bsky.social --days 1 --preview
+  ```
+
+### Check Your Setup
+Run these commands to verify your environment:
+
+```bash
+# Check Python version
+python3 --version
+
+# Check if you're in a virtual environment
+echo $VIRTUAL_ENV
+
+# Check if you have a venv folder
+ls -la | grep venv
 ```
 
 ## Security
