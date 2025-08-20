@@ -227,7 +227,7 @@ python3 byesky.py --handle johnappleseed@bsky.social --no-preview --after 2024-0
 
 ## Troubleshooting
 
-### Common Error: `'NoneType' object is not callable`
+### Error: `'NoneType' object is not callable`
 
 This error typically occurs due to one of these issues:
 
@@ -257,7 +257,7 @@ source venv/bin/activate
 pip install --upgrade pydantic
 
 # Try again
-python byesky.py --handle yourhandle.bsky.social --days 30 --preview
+python byesky.py --handle johnappleseed@bsky.social --days 30 --preview
 ```
 
 #### 3. **Missing Dependencies**
@@ -293,13 +293,13 @@ If the error persists:
 
 - Run with `--verbose` flag to get more detailed error information:
   ```bash
-  python byesky.py --handle yourhandle.bsky.social --days 30 --preview --verbose
+  python byesky.py --handle johnappleseed@bsky.social --days 30 --preview --verbose
   ```
 - Check if you can access your BlueSky account normally
 - Try with a different handle or app password
 - Try with a smaller date range first:
   ```bash
-  python byesky.py --handle yourhandle.bsky.social --days 1 --preview
+  python byesky.py --handle johnappleseed@bsky.social --days 1 --preview
   ```
 
 ### Check Your Setup
