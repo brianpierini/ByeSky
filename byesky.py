@@ -1,155 +1,211 @@
+#!/usr/bin/env python3
+"""
+ByeSky - Delete or preview AT Protocol / Bluesky posts older than N days.
+Supports both Bluesky (bsky.social) and self-hosted PDS instances.
+"""
+
 import os
 import sys
 import logging
 import getpass
 import re
 import json
+import time
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 import click
 from tqdm import tqdm
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from dateutil import parser
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from dateutil import parser as dateutil_parser
 from atproto import Client, models
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-# ─── Logging Setup ───────────────────────────────────────────────────────────────
+BSKY_PDS = "https://bsky.social"
+DELETE_DELAY = 0.5  # seconds between deletes — stays within Bluesky rate limits
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
-# ─── Security Checks ─────────────────────────────────────────────────────────────
-if os.geteuid() == 0:
-    logger.warning("It is not recommended to run this script as root.")
+# ─── Security ────────────────────────────────────────────────────────────────
+if os.name != "nt" and os.geteuid() == 0:
+    logger.warning("Running as root is not recommended.")
 
-# ─── Retry Decorator ─────────────────────────────────────────────────────────────
-retry_on_network = retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
+# ─── Retry ───────────────────────────────────────────────────────────────────
+_network_retry = retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
     retry=retry_if_exception_type(Exception),
-    reraise=True
+    reraise=True,
 )
 
-# ─── Core Logic ────────────────────────────────────────────────────────────────
-@retry_on_network
-def fetch_feed_page(client, actor, cursor, limit):
-    return client.app.bsky.feed.get_author_feed({
-        "actor": actor,
-        "cursor": cursor,
-        "limit": limit
-    })
 
-@retry_on_network
-def delete_record(client, handle, uri):
-    rkey = uri.split("/")[-1]
-    return client.com.atproto.repo.delete_record(models.ComAtprotoRepoDeleteRecord.Data(
-        repo=handle,
-        collection="app.bsky.feed.post",
-        rkey=rkey
-    ))
-
-def process_posts(
-    handle, token, days_old, preview_only, log_file,
-    match_patterns=None, use_regex=False, after=None, before=None, backup_file=None,
-    include_replies=False, include_reposts=False,
-    quiet=False
+@_network_retry
+def _list_records(
+    client: Client,
+    did: str,
+    collection: str,
+    cursor: Optional[str],
+    limit: int = 100,
 ):
-    client = Client()
+    """One page via com.atproto.repo.listRecords."""
+    params: dict = {"repo": did, "collection": collection, "limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    return client.com.atproto.repo.list_records(params)
+
+
+@_network_retry
+def _delete_record(client: Client, did: str, collection: str, rkey: str):
+    """One deletion via com.atproto.repo.deleteRecord."""
+    return client.com.atproto.repo.delete_record(
+        models.ComAtprotoRepoDeleteRecord.Data(
+            repo=did,
+            collection=collection,
+            rkey=rkey,
+        )
+    )
+
+
+# ─── Record helpers ──────────────────────────────────────────────────────────
+def _parse_created_at(value) -> Optional[datetime]:
+    """Return UTC-aware datetime from a record value's createdAt field."""
+    raw: Optional[str] = None
+    if hasattr(value, "created_at"):
+        raw = value.created_at
+    elif isinstance(value, dict):
+        raw = value.get("createdAt") or value.get("created_at")
+    if not raw:
+        return None
+    try:
+        dt = dateutil_parser.isoparse(raw)
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_reply(value) -> bool:
+    if hasattr(value, "reply"):
+        return value.reply is not None
+    if isinstance(value, dict):
+        return value.get("reply") is not None
+    return False
+
+
+def _record_text(value) -> str:
+    if hasattr(value, "text"):
+        return value.text or ""
+    if isinstance(value, dict):
+        return value.get("text", "") or ""
+    return ""
+
+
+# ─── Core logic ──────────────────────────────────────────────────────────────
+def process_posts(
+    *,
+    handle: str,
+    token: str,
+    pds_url: str,
+    days_old: int,
+    preview_only: bool,
+    log_file: Optional[str],
+    match_patterns: Tuple[str, ...],
+    use_regex: bool,
+    after: Optional[str],
+    before: Optional[str],
+    backup_file: Optional[str],
+    include_replies: bool,
+    include_reposts: bool,
+    delete_delay: float,
+    quiet: bool,
+) -> dict:
+    client = Client(base_url=pds_url)
     try:
         client.login(handle, token)
     except Exception as e:
         logger.error("Login failed: %s", e)
-        return {"scanned": 0, "matched": 0, "deleted": 0, "failed": 0}
+        sys.exit(2)
+
+    did: str = client.me.did
+    logger.info("Authenticated  handle=%s  DID=%s  PDS=%s", handle, did, pds_url)
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_old)
+    after_dt = dateutil_parser.parse(after).astimezone(timezone.utc) if after else None
+    before_dt = dateutil_parser.parse(before).astimezone(timezone.utc) if before else None
 
-    # Parse after/before if provided
-    after_dt = parser.parse(after).astimezone(timezone.utc) if after else None
-    before_dt = parser.parse(before).astimezone(timezone.utc) if before else None
+    compiled: list = (
+        [re.compile(p, re.IGNORECASE) for p in match_patterns]
+        if use_regex and match_patterns
+        else list(match_patterns)
+    )
 
-    posts = []
-    cursor = None
+    # posts first, then native reposts if requested
+    collections = ["app.bsky.feed.post"]
+    if include_reposts:
+        collections.append("app.bsky.feed.repost")
 
-    # Prepare matchers
-    compiled_patterns = []
-    if match_patterns:
-        if use_regex:
-            compiled_patterns = [re.compile(p, re.IGNORECASE) for p in match_patterns]
-        else:
-            compiled_patterns = match_patterns
+    # (uri, collection, rkey, created_at, text)
+    candidates: List[Tuple[str, str, str, datetime, str]] = []
+    total_scanned = 0
 
-    if not quiet:
-        logger.info(f"Scanning posts older than {days_old} days…")
+    for collection in collections:
+        cursor: Optional[str] = None
+        label = collection.rsplit(".", 1)[-1]
 
-    # Hide fetching pages progress bar in quiet mode
-    page_bar_args = {"desc": "Fetching pages", "unit": "page"}
-    # Remove disabling in quiet mode
-    # if quiet:
-    #     page_bar_args["disable"] = True
-
-    with tqdm(**page_bar_args) as page_bar:
-        while True:
-            feed = fetch_feed_page(client, handle, cursor, limit=50)
-            for item in feed.feed:
-                pt = parser.isoparse(item.post.indexed_at)
-                try:
-                    pt = pt.astimezone(timezone.utc)
-                except Exception:
-                    pt = pt.replace(tzinfo=timezone.utc)
-                # Change .dict() to .model_dump()
-                record_dict = item.post.record.model_dump()
-                text = record_dict.get("text", "")
-
-                # Filter by cutoff, date range, and match patterns
-                if pt < cutoff:
-                    # Replies: check if 'reply' field exists and is not None
-                    is_reply = getattr(item.post, "reply", None) is not None
-                    # Reposts: check if 'embed' field is a repost (type 'app.bsky.embed.record#view')
-                    embed = getattr(item.post, "embed", None)
-                    is_repost = False
-                    if embed and hasattr(embed, "$type"):
-                        is_repost = embed.type == "app.bsky.embed.record#view"
-                    elif embed and isinstance(embed, dict):
-                        is_repost = embed.get("$type") == "app.bsky.embed.record#view"
-
-                    # Exclude replies/reposts if not included
-                    if (is_reply and not include_replies) or (is_repost and not include_reposts):
+        with tqdm(desc=f"Scanning {label}s", unit=" page", disable=quiet) as pbar:
+            while True:
+                page = _list_records(client, did, collection, cursor)
+                for rec in page.records:
+                    total_scanned += 1
+                    created_at = _parse_created_at(rec.value)
+                    if created_at is None:
+                        logger.debug("Skipping %s — no createdAt", rec.uri)
+                        continue
+                    if created_at >= cutoff:
+                        continue
+                    if after_dt and created_at < after_dt:
+                        continue
+                    if before_dt and created_at > before_dt:
                         continue
 
-                    in_range = True
-                    if after_dt and pt < after_dt:
-                        in_range = False
-                    if before_dt and pt > before_dt:
-                        in_range = False
-                    matched = True
-                    if compiled_patterns:
+                    text = ""
+                    if collection == "app.bsky.feed.post":
+                        if not include_replies and _is_reply(rec.value):
+                            continue
+                        text = _record_text(rec.value)
+
+                    if compiled:
                         if use_regex:
-                            matched = any(p.search(text) for p in compiled_patterns)
+                            if not any(p.search(text) for p in compiled):
+                                continue
                         else:
-                            matched = any(p.lower() in text.lower() for p in compiled_patterns)
-                    if in_range and matched:
-                        posts.append((item.post.uri, item.post, pt))
-            cursor = feed.cursor
-            page_bar.update()
-            if not cursor:
-                break
+                            tl = text.lower()
+                            if not any(p.lower() in tl for p in compiled):
+                                continue
 
-    total = len(posts)
-    if not total:
-        logger.info("✅ No posts to delete/preview.")
-        return {"scanned": page_bar.n * 50, "matched": 0, "deleted": 0, "failed": 0}
+                    rkey = rec.uri.split("/")[-1]
+                    candidates.append((rec.uri, collection, rkey, created_at, text))
 
-    # Decide where to log
-    if not log_file:
-        log_file = "preview_log.txt" if preview_only else "deleted_posts_log.txt"
-    logger.info(f"Writing details to {log_file}")
+                pbar.update()
+                cursor = page.cursor
+                if not cursor:
+                    break
 
-    # Decide backup file
-    if not backup_file:
-        backup_file = "deleted_posts_backup.jsonl"
+        logger.info("Scanned %d %s record(s)", total_scanned, label)
+
+    if not candidates:
+        logger.info("No posts match the given criteria.")
+        return {"scanned": total_scanned, "matched": 0, "deleted": 0, "failed": 0}
+
+    log_file = log_file or ("preview_log.txt" if preview_only else "deleted_posts_log.txt")
+    backup_file = backup_file or "deleted_posts_backup.jsonl"
+    logger.info("Writing log to %s", log_file)
 
     deleted = failed = 0
     backup_fh = None
@@ -157,148 +213,217 @@ def process_posts(
         if not preview_only:
             backup_fh = open(backup_file, "a", encoding="utf-8")
 
-        # Only show the main progress bar if not quiet, otherwise disable it
-        post_bar_args = {"desc": "Processing posts", "unit": "post"}
-        # Remove disabling in quiet mode
-        # if quiet:
-        #     post_bar_args["disable"] = True  # Show progress bar even in quiet mode
-
-        with open(log_file, "a", encoding="utf-8") as f, \
-             tqdm(posts, **post_bar_args) as post_bar:
-            for uri, post, pt in post_bar:
-                # Change .dict() to .model_dump()
-                record_dict = post.record.model_dump()
-                text = record_dict.get("text", "")
-                text = text.replace("\n", " ")
-                f.write(f"{pt.strftime('%Y-%m-%d %H:%M:%S')} UTC  {text}\n---\n")
+        with open(log_file, "a", encoding="utf-8") as log_fh, tqdm(
+            candidates, desc="Processing", unit=" post", disable=quiet
+        ) as bar:
+            for uri, collection, rkey, created_at, text in bar:
+                log_fh.write(
+                    f"{created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC  "
+                    f"{text.replace(chr(10), ' ')}\n---\n"
+                )
                 if not preview_only:
-                    # Backup full post JSON before deletion
-                    backup_fh.write(json.dumps({
-                        "uri": uri,
-                        "datetime": pt.isoformat(),
-                        # Change .dict() to .model_dump()
-                        "post": post.model_dump()
-                    }, ensure_ascii=False) + "\n")
+                    if backup_fh:
+                        backup_fh.write(
+                            json.dumps(
+                                {
+                                    "uri": uri,
+                                    "collection": collection,
+                                    "rkey": rkey,
+                                    "created_at": created_at.isoformat(),
+                                    "text": text,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                     try:
-                        delete_record(client, handle, uri)
+                        _delete_record(client, did, collection, rkey)
                         deleted += 1
+                        time.sleep(delete_delay)
                     except Exception as e:
-                        logger.warning(f"Failed deleting {uri}: {e}")
+                        logger.warning("Failed to delete %s: %s", uri, e)
                         failed += 1
-                post_bar.update()
     finally:
         if backup_fh:
             backup_fh.close()
 
     return {
-        "scanned": page_bar.n * 50,
-        "matched": total,
+        "scanned": total_scanned,
+        "matched": len(candidates),
         "deleted": deleted,
-        "failed": failed
+        "failed": failed,
     }
 
-# ─── CLI ENTRYPOINT ────────────────────────────────────────────────────────────
-@click.command(
-    help="Delete or preview BlueSky posts older than N days.\n\n"
-         "SECURITY TIP: For automation, consider passing your app password via the BYESKY_TOKEN environment variable instead of the --token argument."
-)
-@click.version_option(__version__, "--version", message="ByeSky version %(version)s")
-@click.option("--handle", "-u", prompt="BlueSky handle", help="e.g. yourname.bsky.social")
-@click.option("--token", "-p", default=None, help="App password (16-char); will prompt if missing")
-@click.option("--days", "-d", default=30, show_default=True,
-              help="Delete posts older than this many days")
-@click.option("--preview/--no-preview", default=True,
-              help="Only show what would be deleted without actually deleting")
-@click.option("--log-file", "-l", default=None,
-              help="Override log file name (defaults to preview_log.txt or deleted_posts_log.txt)")
-@click.option("--match", "-m", multiple=True, help="Only delete posts containing this keyword or matching regex (can be used multiple times)")
-@click.option("--regex/--no-regex", default=False, help="Interpret --match patterns as regex")
-@click.option("--after", default=None, help="Only consider posts after this date (YYYY-MM-DD or ISO format)")
-@click.option("--before", default=None, help="Only consider posts before this date (YYYY-MM-DD or ISO format)")
-@click.option("--backup-file", default=None, help="Backup deleted posts to this JSONL file (default: deleted_posts_backup.jsonl)")
-@click.option("--include-replies/--exclude-replies", default=False, help="Include replies (default: exclude)")
-@click.option("--include-reposts/--exclude-reposts", default=False, help="Include reposts (default: exclude)")
-@click.option("--verbose", is_flag=True, default=False, help="Enable verbose output (DEBUG logging)")
-@click.option("--quiet", is_flag=True, default=False, help="Suppress most output except errors")
-def cli(handle, token, days, preview, log_file, match, regex, after, before, backup_file, include_replies, include_reposts, verbose, quiet):
-    # Set logging level based on flags
-    if quiet:
-        logger.setLevel(logging.ERROR)
-    elif verbose:
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
 
-    # Prevent accidental deletion with low --days
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+@click.command(
+    help=(
+        "Delete or preview AT Protocol / Bluesky posts older than N days.\n\n"
+        "Supports Bluesky (bsky.social) and self-hosted PDS instances via --pds.\n\n"
+        "SECURITY: Pass your app password via the BYESKY_TOKEN environment variable "
+        "rather than --token to avoid exposing it in your process list."
+    )
+)
+@click.version_option(__version__, "--version", message="%(prog)s %(version)s")
+@click.option(
+    "--handle", "-u",
+    prompt="Bluesky handle",
+    help="Your handle, e.g. alice.bsky.social or alice.example.com",
+)
+@click.option(
+    "--token", "-p",
+    default=None,
+    envvar="BYESKY_TOKEN",
+    help="App password; falls back to BYESKY_TOKEN env var, then interactive prompt",
+)
+@click.option(
+    "--pds",
+    default=BSKY_PDS,
+    show_default=True,
+    help="AT Protocol PDS base URL (set to your PDS for self-hosted instances)",
+)
+@click.option(
+    "--days", "-d",
+    default=30,
+    show_default=True,
+    help="Target posts older than this many days",
+)
+@click.option(
+    "--preview/--no-preview",
+    default=True,
+    help="Dry run — show what would be deleted without deleting (default: --preview)",
+)
+@click.option(
+    "--log-file", "-l",
+    default=None,
+    help="Log filename (default: preview_log.txt or deleted_posts_log.txt)",
+)
+@click.option(
+    "--match", "-m",
+    multiple=True,
+    help="Only target posts containing this keyword; may be repeated",
+)
+@click.option(
+    "--regex/--no-regex",
+    default=False,
+    help="Treat --match values as regular expressions",
+)
+@click.option(
+    "--after",
+    default=None,
+    metavar="DATE",
+    help="Only target posts on or after this date (YYYY-MM-DD or ISO 8601)",
+)
+@click.option(
+    "--before",
+    default=None,
+    metavar="DATE",
+    help="Only target posts on or before this date (YYYY-MM-DD or ISO 8601)",
+)
+@click.option(
+    "--backup-file",
+    default=None,
+    help="JSONL file for deleted-post backups (default: deleted_posts_backup.jsonl)",
+)
+@click.option(
+    "--include-replies/--exclude-replies",
+    default=False,
+    help="Include reply posts (default: exclude)",
+)
+@click.option(
+    "--include-reposts/--exclude-reposts",
+    default=False,
+    help="Include native reposts (app.bsky.feed.repost records; default: exclude)",
+)
+@click.option(
+    "--delete-delay",
+    default=DELETE_DELAY,
+    show_default=True,
+    type=float,
+    help="Seconds between deletions (rate-limit buffer)",
+)
+@click.option("--verbose", is_flag=True, default=False, help="Enable DEBUG logging")
+@click.option("--quiet", is_flag=True, default=False, help="Suppress all output except errors and the summary")
+def cli(
+    handle, token, pds, days, preview, log_file, match, regex,
+    after, before, backup_file, include_replies, include_reposts,
+    delete_delay, verbose, quiet,
+):
+    level = logging.ERROR if quiet else (logging.DEBUG if verbose else logging.INFO)
+    logger.setLevel(level)
+    for lib in ("atproto_client", "httpx"):
+        logging.getLogger(lib).setLevel(logging.DEBUG if verbose else logging.WARNING)
+
     if not preview and days < 1:
-        logger.error("Refusing to delete posts newer than 1 day. Use --days 1 or higher.")
+        logger.error("Refusing to target posts newer than 1 day. Use --days 1 or higher.")
         sys.exit(2)
 
-    # Control atproto_client HTTP request logs
-    atproto_logger = logging.getLogger("atproto_client")
-    httpx_logger = logging.getLogger("httpx")
-    if quiet:
-        atproto_logger.setLevel(logging.ERROR)
-        httpx_logger.setLevel(logging.ERROR)
-    elif verbose:
-        atproto_logger.setLevel(logging.DEBUG)
-        httpx_logger.setLevel(logging.DEBUG)
-    else:
-        atproto_logger.setLevel(logging.WARNING)
-        httpx_logger.setLevel(logging.WARNING)
+    # Normalise PDS URL
+    pds = pds.rstrip("/")
+    if "://" not in pds:
+        pds = f"https://{pds}"
 
-    # Warn if token is passed via command line (visible in process list)
     if token and "BYESKY_TOKEN" not in os.environ:
-        logger.warning("SECURITY: Passing the app password via --token exposes it in your process list. "
-                       "For automation, set the BYESKY_TOKEN environment variable instead.")
+        logger.warning(
+            "SECURITY: --token exposes your password in the process list. "
+            "Use the BYESKY_TOKEN environment variable for automation."
+        )
 
-    # Mask token in logs (never print token)
-    token_masked = "*" * len(token) if token else None
-    logger.info(f"Using handle: {handle}, token: {token_masked}, days: {days}, preview: {preview}")
-
-    # Prefer environment variable for token if available
-    if not token:
-        token = os.environ.get("BYESKY_TOKEN")
     if not token:
         token = getpass.getpass("App password: ").strip()
 
-    # Confirm deletion unless preview or quiet
+    if not quiet:
+        logger.info(
+            "handle=%s  pds=%s  days=%d  preview=%s",
+            handle, pds, days, preview,
+        )
+
     if not preview and not quiet:
         click.confirm(
-            f"Are you sure you want to DELETE posts older than {days} days? This cannot be undone.",
-            abort=True
+            f"Delete posts older than {days} days from {handle}? This cannot be undone.",
+            abort=True,
         )
 
     try:
         result = process_posts(
-            handle, token, days, preview, log_file,
-            match_patterns=match, use_regex=regex,
-            after=after, before=before,
+            handle=handle,
+            token=token,
+            pds_url=pds,
+            days_old=days,
+            preview_only=preview,
+            log_file=log_file,
+            match_patterns=match,
+            use_regex=regex,
+            after=after,
+            before=before,
             backup_file=backup_file,
             include_replies=include_replies,
             include_reposts=include_reposts,
-            quiet=quiet
+            delete_delay=delete_delay,
+            quiet=quiet,
         )
     except (OSError, IOError) as e:
-        logger.error(f"File error: {e}")
+        logger.error("File error: %s", e)
         sys.exit(3)
+    except SystemExit:
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error("Unexpected error: %s", e)
         sys.exit(99)
 
-    # Always show summary, even in quiet mode
-    click.echo("\n── Summary ──────────────────────────")
-    click.echo(f" Posts scanned   : {result['scanned']}")
-    click.echo(f" Posts matched   : {result['matched']}")
+    effective_log = log_file or ("preview_log.txt" if preview else "deleted_posts_log.txt")
+    click.echo("\n── Summary ───────────────────────────────")
+    click.echo(f"  Posts scanned   : {result['scanned']}")
+    click.echo(f"  Posts matched   : {result['matched']}")
     if not preview:
-        click.echo(f" Posts deleted   : {result['deleted']}")
-        click.echo(f" Delete failures : {result['failed']}")
-    # Mask password in summary/log output
-    click.echo(f" Log file        : {log_file or ('preview_log.txt' if preview else 'deleted_posts_log.txt')}")
-    click.echo("──────────────────────────────────────")
+        click.echo(f"  Posts deleted   : {result['deleted']}")
+        click.echo(f"  Delete failures : {result['failed']}")
+    click.echo(f"  Log file        : {effective_log}")
+    click.echo("──────────────────────────────────────────")
 
-    if result["failed"] > 0:
+    if result.get("failed", 0) > 0:
         sys.exit(1)
+
 
 if __name__ == "__main__":
     cli()

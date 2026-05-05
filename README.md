@@ -2,28 +2,29 @@
 
 ![Demo of ByeSky in action](media/byesky_demo.gif)
 
-ByeSky is a CLI tool to delete BlueSky posts older than a specified number of days, with advanced filtering, backup, preview and automation options.
+ByeSky is a CLI tool to delete Bluesky / AT Protocol posts older than a specified number of days, with advanced filtering, backup, preview, and automation options.
+
+Supports both **Bluesky (bsky.social)** and **self-hosted PDS** instances.
 
 ## Motivation
 
-I believe that opinions change, trends fade, and not every thought or post needs to live online forever. As someone who values privacy, I wanted a tool that empowers users to easily and safely clean up their BlueSky history giving them control over what remains public. ByeSky is designed to make it simple to review, filter, and remove old posts.
+Opinions change, trends fade, and not every thought needs to live online forever. ByeSky gives you control over your post history — safely preview what would be deleted, then remove it.
 
 ## Features
 
-- Export logs
-- Verbose and quiet modes
-- Cron job friendly
-- Advanced filtering (date, keyword, regex, replies, reposts)
-- Backup deleted posts
+- **AT Protocol spec-compliant** — uses `com.atproto.repo.listRecords` and `com.atproto.repo.deleteRecord` directly, no AppView dependency
+- **Self-hosted PDS support** — point `--pds` at any AT Protocol PDS
+- **Preview mode** — see exactly what would be deleted before committing
+- **Advanced filtering** — by age, date range, keyword, regex, replies, and native reposts
+- **Backup** — every deleted post is saved to a JSONL file before removal
+- **Rate-limit aware** — configurable delay between deletions
+- **Automation-friendly** — quiet mode, env-var auth, non-zero exit codes
+- **Verbose and quiet modes**
+- **Cron-job friendly**
 
 ## Disclaimer
 
-**Warning:** This tool performs irreversible data deletion. Use with caution.  
-Double-check your filters and options before running by using `--preview`.  
-
-**The `--preview` option will only show what would be deleted and will NOT delete any posts.**  
-
-**The `--no-preview` option will actually delete the matching posts.**  
+**Warning:** Deletion is irreversible. Always run with `--preview` first and review the log before using `--no-preview`.
 
 The author is **not responsible** for any data loss or unintended consequences.
 
@@ -35,59 +36,47 @@ The author is **not responsible** for any data loss or unintended consequences.
     cd ByeSky
     ```
 
-2. [Create a BlueSky app password](https://bsky.app/settings/app-passwords).
+2. [Create a Bluesky app password](https://bsky.app/settings/app-passwords).
 
 ### Option 1: Virtual Environment (Recommended)
 
 ```zsh
-# Create a virtual environment
 python3 -m venv venv
-
-# Activate the virtual environment
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run ByeSky (make sure venv is activated)
 python byesky.py --handle yourhandle.bsky.social --days 30 --preview
 ```
 
-### Option 2: Using pipx (macOS-friendly)
+### Option 2: pipx (macOS-friendly, installs globally without conflicts)
 
 ```zsh
-# Install pipx (if not already installed)
 brew install pipx
-
-# Install ByeSky globally with pipx
 pipx install .
-
-# Run ByeSky
 byesky --handle yourhandle.bsky.social --days 30 --preview
 ```
 
-### Option 3: Direct Installation (Not Recommended)
+### Option 3: Direct (not recommended)
 
 ```zsh
-# Install dependencies globally (may cause conflicts)
 pip3 install -r requirements.txt --break-system-packages
 ```
 
-> **Note:**  
-> ByeSky is compatible with Pydantic v2 and newer.  
-> If you see errors about `.dict()`, upgrade Pydantic:  
-> `pip install --upgrade pydantic`  
-> Requires Python 3.8 or newer (recommended).
+> Requires Python 3.8+. Compatible with Pydantic v2+.
 
 ## Quick Start
 
 ```zsh
-python3 byesky.py --handle johnappleseed@bsky.social --days 30 --preview
+# Preview posts older than 30 days (default — nothing is deleted)
+python3 byesky.py --handle alice.bsky.social --days 30 --preview
+
+# Actually delete them
+python3 byesky.py --handle alice.bsky.social --days 30 --no-preview
+
+# Self-hosted PDS
+python3 byesky.py --handle alice.example.com --pds https://pds.example.com --days 30 --preview
 ```
 
-- By default, this will **preview** posts older than 30 days.
-- To actually delete, add `--no-preview`.
-- You will be prompted for your app password, or set it via the `BYESKY_TOKEN` environment variable.
+You will be prompted for your app password, or set it via `BYESKY_TOKEN`.
 
 ## Usage
 
@@ -95,232 +84,165 @@ python3 byesky.py --handle johnappleseed@bsky.social --days 30 --preview
 python3 byesky.py [OPTIONS]
 ```
 
-### Required
-
-- `--handle`, `-u`  
-  Your BlueSky handle (e.g., `johnappleseed@bsky.social`).
-
 ### Authentication
 
-- `--token`, `-p`  
-  Your BlueSky app password (16 chars). If omitted, you will be prompted.
-  **Tip:** For automation, set the `BYESKY_TOKEN` environment variable.
+| Option | Description |
+|--------|-------------|
+| `--handle`, `-u` | Your AT Protocol handle (e.g. `alice.bsky.social`) |
+| `--token`, `-p` | App password — reads `BYESKY_TOKEN` env var if not provided, then prompts |
 
-### Age Filtering
+**Tip:** For automation, set `BYESKY_TOKEN` in your environment instead of using `--token`.
 
-- `--days`, `-d`  
-  Delete posts older than this many days.  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --days 60 --preview
-  ```
+### PDS / Server
 
-### Preview Mode
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--pds` | `https://bsky.social` | AT Protocol PDS base URL |
 
-- `--preview/--no-preview`  
-  Only show what would be deleted, do not actually delete.  
-  Default: `--preview`  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --days 30 --preview
-  ```
+For a self-hosted PDS, set `--pds https://your-pds.example.com`. Your handle and app password are resolved against that PDS.
 
-### Logging
+### Filtering
 
-- `--log-file`, `-l`  
-  Override log file name.  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --days 30 --log-file mylog.txt
-  ```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--days`, `-d` | `30` | Target posts older than this many days |
+| `--after DATE` | — | Only target posts on or after this date (YYYY-MM-DD or ISO 8601) |
+| `--before DATE` | — | Only target posts on or before this date |
+| `--match`, `-m` | — | Only target posts containing this keyword (repeatable) |
+| `--regex/--no-regex` | off | Treat `--match` values as regular expressions |
+| `--include-replies/--exclude-replies` | exclude | Include reply posts |
+| `--include-reposts/--exclude-reposts` | exclude | Include native reposts (`app.bsky.feed.repost` records) |
 
-### Keyword/Regex Filtering
+### Preview & Safety
 
-- `--match`, `-m`  
-  Only delete posts containing this keyword or matching regex. Can be used multiple times.  
-  Example (keyword):  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --days 30 --match hello --match world
-  ```
-  Example (regex):  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --days 30 --match '^foo.*bar$' --regex
-  ```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--preview/--no-preview` | `--preview` | Dry run — show what would be deleted without deleting |
 
-- `--regex/--no-regex`  
-  Interpret `--match` patterns as regex.  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --days 30 --match 'test\d+' --regex
-  ```
+**Always preview first.** Deletion is permanent.
 
-### Date Range Filtering
+### Output & Logging
 
-- `--after`  
-  Only consider posts after this date (inclusive).  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --after 2024-01-01 --preview
-  ```
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--log-file`, `-l` | auto | Log filename (default: `preview_log.txt` or `deleted_posts_log.txt`) |
+| `--backup-file` | `deleted_posts_backup.jsonl` | JSONL file for deleted-post backups |
+| `--verbose` | off | Enable DEBUG logging |
+| `--quiet` | off | Suppress all output except errors and the final summary |
 
-- `--before`  
-  Only consider posts before this date (inclusive).  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --before 2024-06-01 --preview
-  ```
+### Rate Limiting
 
-### Backup
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--delete-delay` | `0.5` | Seconds between deletions (rate-limit buffer) |
 
-- `--backup-file`  
-  Backup deleted posts to this JSONL file (default: `deleted_posts_backup.jsonl`).  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --no-preview --backup-file my_backup.jsonl
-  ```
+Bluesky's write rate limits are roughly 1,666 requests per 5 minutes. The default 0.5 s delay (~120 deletes/min) stays safely within that.
 
-### Replies and Reposts
-
-- `--include-replies/--exclude-replies`  
-  Include or exclude replies (default: exclude).  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --preview --include-replies
-  ```
-
-- `--include-reposts/--exclude-reposts`  
-  Include or exclude reposts (default: exclude).  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --no-preview --include-reposts
-  ```
-
-### Output Modes
-
-- `--verbose`  
-  Enable verbose output (DEBUG logging, show HTTP requests).  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --preview --verbose
-  ```
-
-- `--quiet`  
-  Suppress most output except errors and summary.  
-  Progress bars are still shown in quiet mode.  
-  HTTP request logs are suppressed in quiet mode.  
-  Example:  
-  ```
-  python3 byesky.py --handle johnappleseed@bsky.social --no-preview --quiet
-  ```
-
-### Example: Delete posts older than 6 months (for cron job)
+## Examples
 
 ```zsh
-python3 byesky.py --handle johnappleseed@bsky.social --token YOUR_APP_PASSWORD --no-preview --days 180 --quiet
+# Preview posts older than 6 months
+python3 byesky.py --handle alice.bsky.social --days 180 --preview
+
+# Delete posts older than 30 days (cron-friendly, token via env var)
+BYESKY_TOKEN=xxxx-xxxx-xxxx-xxxx \
+  python3 byesky.py --handle alice.bsky.social --days 30 --no-preview --quiet
+
+# Delete posts matching a keyword, including replies, with backup
+python3 byesky.py --handle alice.bsky.social --no-preview \
+  --match "old opinion" --include-replies --backup-file backup.jsonl
+
+# Regex filter: posts starting with "hot take"
+python3 byesky.py --handle alice.bsky.social --preview \
+  --match '^hot take' --regex
+
+# Delete posts in a date range
+python3 byesky.py --handle alice.bsky.social --no-preview \
+  --after 2024-01-01 --before 2024-06-30
+
+# Self-hosted PDS
+python3 byesky.py --handle alice.example.com \
+  --pds https://pds.example.com --days 30 --preview
 ```
 
-### Example: Delete posts after a certain date, including replies, with backup
+## Self-Hosted PDS
+
+If you run your own AT Protocol PDS, pass its base URL with `--pds`:
 
 ```zsh
-python3 byesky.py --handle johnappleseed@bsky.social --no-preview --after 2024-01-01 --include-replies --backup-file backup.jsonl
+python3 byesky.py \
+  --handle alice.example.com \
+  --pds https://pds.example.com \
+  --days 30 \
+  --preview
 ```
+
+ByeSky communicates directly with your PDS using the `com.atproto.repo.*` lexicons, so it does not depend on Bluesky's AppView or any Bluesky-specific infrastructure.
+
+## How It Works
+
+ByeSky uses the AT Protocol lexicons directly:
+
+| Operation | Lexicon |
+|-----------|---------|
+| Authentication | `com.atproto.server.createSession` |
+| Listing posts | `com.atproto.repo.listRecords` (`app.bsky.feed.post`) |
+| Listing reposts | `com.atproto.repo.listRecords` (`app.bsky.feed.repost`) |
+| Deleting | `com.atproto.repo.deleteRecord` |
+
+All repository operations use your DID (resolved at login) rather than your handle, which is the spec-correct identifier for repo operations.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | One or more deletions failed |
+| `2` | Safety check failed (e.g. `--days 0` with `--no-preview`) or login failed |
+| `3` | File I/O error |
+| `99` | Unexpected error |
 
 ## Troubleshooting
 
-### Error: `'NoneType' object is not callable`
+### Login fails
 
-This error typically occurs due to one of these issues:
+- Confirm you are using an **app password**, not your main Bluesky password.
+- For self-hosted PDS: verify the `--pds` URL is correct and reachable.
+- Run with `--verbose` to see the full HTTP exchange.
 
-#### 1. **Virtual Environment Not Activated**
-If you're not using a virtual environment, you need to activate it first:
+### `'NoneType' object is not callable` / Pydantic errors
 
-```bash
-# Make sure you're in the ByeSky directory
-cd /path/to/ByeSky
-
-# Activate the virtual environment
+```zsh
 source venv/bin/activate
-
-# You should see (venv) at the start of your prompt
-# Then run the script
-python byesky.py --handle yourhandle.bsky.social --days 30 --preview
+pip install --upgrade pydantic atproto
 ```
 
-#### 2. **Pydantic Version Compatibility**
-The most likely cause is an outdated Pydantic version:
+### Missing dependencies
 
-```bash
-# Make sure virtual environment is activated
+```zsh
 source venv/bin/activate
-
-# Upgrade Pydantic
-pip install --upgrade pydantic
-
-# Try again
-python byesky.py --handle johnappleseed@bsky.social --days 30 --preview
-```
-
-#### 3. **Missing Dependencies**
-Some required packages might not be installed properly:
-
-```bash
-# Make sure virtual environment is activated
-source venv/bin/activate
-
-# Reinstall dependencies
 pip install -r requirements.txt
 ```
 
-#### 4. **macOS Python Environment Issues**
-macOS has an externally managed Python environment. If you don't have a virtual environment:
+### macOS externally managed Python
 
-```bash
-# Create a virtual environment
+```zsh
 python3 -m venv venv
-
-# Activate it
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Test the script
 python byesky.py --help
 ```
 
-#### 5. **Additional Debugging**
-If the error persists:
+### Too many deletion failures
 
-- Run with `--verbose` flag to get more detailed error information:
-  ```bash
-  python byesky.py --handle johnappleseed@bsky.social --days 30 --preview --verbose
-  ```
-- Check if you can access your BlueSky account normally
-- Try with a different handle or app password
-- Try with a smaller date range first:
-  ```bash
-  python byesky.py --handle johnappleseed@bsky.social --days 1 --preview
-  ```
-
-### Check Your Setup
-Run these commands to verify your environment:
-
-```bash
-# Check Python version
-python3 --version
-
-# Check if you're in a virtual environment
-echo $VIRTUAL_ENV
-
-# Check if you have a venv folder
-ls -la | grep venv
-```
+Lower `--delete-delay` or increase it if you're hitting rate limits. Failures are retried up to 5 times with exponential back-off.
 
 ## Security
 
-- Use an app password, not your main BlueSky password.
-- Consider using environment variables or a secrets manager for automation.
+- Use an **app password**, not your main password.
+- Store the token in `BYESKY_TOKEN` or a secrets manager — never hard-code it.
+- ByeSky never prints your token; it is masked in all log output.
 
 ## License
 
-MIT
+MIT — Copyright 2025 Brian Pierini
