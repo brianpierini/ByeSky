@@ -22,6 +22,17 @@ Opinions change, trends fade, and not every thought needs to live online forever
 - **Verbose and quiet modes**
 - **Cron-job friendly**
 
+## What's New in v0.2.0
+
+- **Self-hosted PDS support** via `--pds` — works with any AT Protocol-compliant server
+- **Spec-compliant API** — switched from `app.bsky.feed.getAuthorFeed` to `com.atproto.repo.listRecords`, removing the AppView dependency
+- **DID-based operations** — all repo calls now use your DID (resolved at login) instead of your handle
+- **Fixed repost detection** — native reposts are fetched from the `app.bsky.feed.repost` collection; previously only embedded reposts were checked
+- **Fixed reply detection** — checks the `reply` field on raw record values rather than the feed view
+- **Rate-limit buffer** — configurable `--delete-delay` (default 0.5 s) between deletions
+- **Improved retry logic** — 5 attempts with 2–60 s exponential back-off (up from 3 attempts)
+- **Accurate scan count** — counts every record scanned rather than estimating from page count
+
 ## Disclaimer
 
 **Warning:** Deletion is irreversible. Always run with `--preview` first and review the log before using `--no-preview`.
@@ -77,6 +88,13 @@ python3 byesky.py --handle alice.example.com --pds https://pds.example.com --day
 ```
 
 You will be prompted for your app password, or set it via `BYESKY_TOKEN`.
+
+> **zsh tip:** Always quote the `--pds` URL to prevent zsh from interpreting `://` as a glob:
+> ```zsh
+> python3 byesky.py --handle alice.example.com --pds "https://pds.example.com" --days 30 --preview
+> ```
+
+> **Custom domain handles:** If your handle is a custom domain (e.g. `alice.example.com` rather than `alice.bsky.social`), ByeSky resolves it to your DID automatically — just pass the handle as-is.
 
 ## Usage
 
@@ -172,12 +190,45 @@ If you run your own AT Protocol PDS, pass its base URL with `--pds`:
 ```zsh
 python3 byesky.py \
   --handle alice.example.com \
-  --pds https://pds.example.com \
+  --pds "https://pds.example.com" \
   --days 30 \
   --preview
 ```
 
-ByeSky communicates directly with your PDS using the `com.atproto.repo.*` lexicons, so it does not depend on Bluesky's AppView or any Bluesky-specific infrastructure.
+ByeSky communicates directly with your PDS using the `com.atproto.repo.*` lexicons — no dependency on Bluesky's AppView or any Bluesky-specific infrastructure.
+
+### Finding your PDS URL
+
+If you're not sure what your PDS URL is, you can look it up from your handle:
+
+```zsh
+# Step 1 — resolve your handle to a DID
+curl -s "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle=alice.example.com"
+
+# Step 2 — look up the DID document to find your PDS serviceEndpoint
+curl -s "https://plc.directory/<your-did>" | python3 -m json.tool
+```
+
+Look for `"serviceEndpoint"` under `"#atproto_pds"` in the DID document — that is your PDS URL.
+
+### App passwords on self-hosted PDS
+
+You need an app password from your PDS, separate from any Bluesky app passwords. Check your PDS's settings or account page. If your PDS does not expose an app password UI, you can create one via the API:
+
+```zsh
+# Get an access token
+curl -s -X POST "https://pds.example.com/xrpc/com.atproto.server.createSession" \
+  -H "Content-Type: application/json" \
+  -d '{"identifier":"alice.example.com","password":"YOUR_PASSWORD"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['accessJwt'])"
+
+# Create an app password
+curl -s -X POST "https://pds.example.com/xrpc/com.atproto.server.createAppPassword" \
+  -H "Authorization: Bearer <accessJwt>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"byesky"}' \
+  | python3 -m json.tool
+```
 
 ## How It Works
 
@@ -241,7 +292,7 @@ Lower `--delete-delay` or increase it if you're hitting rate limits. Failures ar
 
 - Use an **app password**, not your main password.
 - Store the token in `BYESKY_TOKEN` or a secrets manager — never hard-code it.
-- ByeSky never prints your token; it is masked in all log output.
+- ByeSky never prints or logs your token.
 
 ## License
 
