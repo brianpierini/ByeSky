@@ -16,14 +16,18 @@ from typing import List, Optional, Tuple
 
 import click
 from tqdm import tqdm
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from dateutil import parser as dateutil_parser
 from atproto import Client, models
+from atproto.exceptions import RequestException
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 BSKY_PDS = "https://bsky.social"
-DELETE_DELAY = 0.5  # seconds between deletes — stays within Bluesky rate limits
+# Bluesky meters writes by points (DELETE = 1 pt): 5,000/hour and 35,000/day
+# per account. 0.75s between deletes keeps a steady run just under 5,000/hr so
+# the hourly wall is rarely hit; when it is, we back off on the reset header.
+DELETE_DELAY = 0.75  # seconds between deletes — stays within Bluesky rate limits
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,11 +41,55 @@ logger = logging.getLogger(__name__)
 if os.name != "nt" and os.geteuid() == 0:
     logger.warning("Running as root is not recommended.")
 
+# ─── Rate limiting ───────────────────────────────────────────────────────────
+class RateLimitError(Exception):
+    """Raised on a 429 from the PDS, carrying the reset window details."""
+
+    def __init__(self, reset_at: Optional[int], window: Optional[int], limit):
+        self.reset_at = reset_at   # unix epoch when the window resets, if known
+        self.window = window       # window length in seconds (3600 / 86400)
+        self.limit = limit         # the policy's point ceiling for that window
+        super().__init__(f"Rate limit exceeded (limit={limit}, window={window}s)")
+
+
+class DailyLimitReached(Exception):
+    """Raised when the 35,000/day write limit is hit — resume on the next day."""
+
+    def __init__(self, reset_at: Optional[int]):
+        self.reset_at = reset_at
+        super().__init__("Daily write rate limit reached")
+
+
+def _ratelimit_from_exc(exc: RequestException) -> Optional[RateLimitError]:
+    """Return a RateLimitError if exc is a 429, parsing rate-limit headers."""
+    resp = getattr(exc, "response", None)
+    if resp is None or getattr(resp, "status_code", None) != 429:
+        return None
+    # Response.headers is a plain dict; keys arrive lowercased but be defensive.
+    headers = {str(k).lower(): v for k, v in (getattr(resp, "headers", None) or {}).items()}
+
+    def _to_int(val):
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+    reset_at = _to_int(headers.get("ratelimit-reset"))
+    limit = headers.get("ratelimit-limit")
+    window = None
+    m = re.search(r"w=(\d+)", str(headers.get("ratelimit-policy", "")))
+    if m:
+        window = int(m.group(1))
+    return RateLimitError(reset_at=reset_at, window=window, limit=limit)
+
+
 # ─── Retry ───────────────────────────────────────────────────────────────────
+# Retry transient network errors, but never a rate-limit signal — those are
+# handled deliberately by waiting on the reset header (see _delete_with_backoff).
 _network_retry = retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=2, min=2, max=60),
-    retry=retry_if_exception_type(Exception),
+    retry=retry_if_exception(lambda e: not isinstance(e, (RateLimitError, DailyLimitReached))),
     reraise=True,
 )
 
@@ -64,13 +112,46 @@ def _list_records(
 @_network_retry
 def _delete_record(client: Client, did: str, collection: str, rkey: str):
     """One deletion via com.atproto.repo.deleteRecord."""
-    return client.com.atproto.repo.delete_record(
-        models.ComAtprotoRepoDeleteRecord.Data(
-            repo=did,
-            collection=collection,
-            rkey=rkey,
+    try:
+        return client.com.atproto.repo.delete_record(
+            models.ComAtprotoRepoDeleteRecord.Data(
+                repo=did,
+                collection=collection,
+                rkey=rkey,
+            )
         )
-    )
+    except RequestException as e:
+        rl = _ratelimit_from_exc(e)
+        if rl is not None:
+            raise rl from e
+        raise
+
+
+def _delete_with_backoff(client: Client, did: str, collection: str, rkey: str):
+    """Delete one record, waiting out the hourly write limit.
+
+    The hourly window (5,000/hr) is handled by sleeping until its reset header
+    and retrying the same delete. The daily window (35,000/day) would mean
+    blocking for up to 24h, so it is surfaced as DailyLimitReached for a clean,
+    resumable exit instead.
+    """
+    while True:
+        try:
+            return _delete_record(client, did, collection, rkey)
+        except RateLimitError as rl:
+            # Daily window (w > 1 hour): don't block for hours — bail to resume later.
+            if rl.window and rl.window > 3600:
+                raise DailyLimitReached(rl.reset_at) from rl
+            wait_s = max(0.0, rl.reset_at - time.time()) if rl.reset_at else 60.0
+            reset_str = (
+                datetime.fromtimestamp(rl.reset_at, timezone.utc).strftime("%H:%M:%S UTC")
+                if rl.reset_at else "unknown"
+            )
+            logger.warning(
+                "Hourly write limit reached (%s/hr). Waiting ~%d min until reset at %s…",
+                rl.limit or "5000", int(wait_s // 60) + 1, reset_str,
+            )
+            time.sleep(wait_s + 2)
 
 
 # ─── Record helpers ──────────────────────────────────────────────────────────
@@ -208,6 +289,7 @@ def process_posts(
     logger.info("Writing log to %s", log_file)
 
     deleted = failed = 0
+    hit_daily_limit = False
     backup_fh = None
     try:
         if not preview_only:
@@ -217,32 +299,47 @@ def process_posts(
             candidates, desc="Processing", unit=" post", disable=quiet
         ) as bar:
             for uri, collection, rkey, created_at, text in bar:
-                log_fh.write(
+                log_line = (
                     f"{created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC  "
                     f"{text.replace(chr(10), ' ')}\n---\n"
                 )
-                if not preview_only:
-                    if backup_fh:
-                        backup_fh.write(
-                            json.dumps(
-                                {
-                                    "uri": uri,
-                                    "collection": collection,
-                                    "rkey": rkey,
-                                    "created_at": created_at.isoformat(),
-                                    "text": text,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
+                if preview_only:
+                    log_fh.write(log_line)
+                    continue
+
+                try:
+                    _delete_with_backoff(client, did, collection, rkey)
+                except DailyLimitReached:
+                    logger.warning(
+                        "Daily write limit (35,000/day) reached — stopping. "
+                        "Re-run ByeSky after the window resets to delete the rest; "
+                        "it will skip what's already gone."
+                    )
+                    hit_daily_limit = True
+                    break
+                except Exception as e:
+                    logger.warning("Failed to delete %s: %s", uri, e)
+                    failed += 1
+                    continue
+
+                # Record log + backup only after a confirmed deletion.
+                log_fh.write(log_line)
+                if backup_fh:
+                    backup_fh.write(
+                        json.dumps(
+                            {
+                                "uri": uri,
+                                "collection": collection,
+                                "rkey": rkey,
+                                "created_at": created_at.isoformat(),
+                                "text": text,
+                            },
+                            ensure_ascii=False,
                         )
-                    try:
-                        _delete_record(client, did, collection, rkey)
-                        deleted += 1
-                        time.sleep(delete_delay)
-                    except Exception as e:
-                        logger.warning("Failed to delete %s: %s", uri, e)
-                        failed += 1
+                        + "\n"
+                    )
+                deleted += 1
+                time.sleep(delete_delay)
     finally:
         if backup_fh:
             backup_fh.close()
@@ -252,6 +349,7 @@ def process_posts(
         "matched": len(candidates),
         "deleted": deleted,
         "failed": failed,
+        "hit_daily_limit": hit_daily_limit,
     }
 
 
@@ -418,9 +516,14 @@ def cli(
     if not preview:
         click.echo(f"  Posts deleted   : {result['deleted']}")
         click.echo(f"  Delete failures : {result['failed']}")
+        remaining = result["matched"] - result["deleted"] - result["failed"]
+        if result.get("hit_daily_limit"):
+            click.echo(f"  Not yet deleted : {remaining} (daily limit — re-run to continue)")
     click.echo(f"  Log file        : {effective_log}")
     click.echo("──────────────────────────────────────────")
 
+    if result.get("hit_daily_limit"):
+        sys.exit(75)  # EX_TEMPFAIL — retry later
     if result.get("failed", 0) > 0:
         sys.exit(1)
 
