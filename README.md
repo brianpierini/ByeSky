@@ -17,10 +17,22 @@ Opinions change, trends fade, and not every thought needs to live online forever
 - **Preview mode** — see exactly what would be deleted before committing
 - **Advanced filtering** — by age, date range, keyword, regex, replies, and native reposts
 - **Backup** — every deleted post is saved to a JSONL file before removal
-- **Rate-limit aware** — configurable delay between deletions
+- **Rate-limit aware** — steady pacing plus automatic back-off on the hourly limit and a clean, resumable exit on the daily limit
 - **Automation-friendly** — quiet mode, env-var auth, non-zero exit codes
 - **Verbose and quiet modes**
 - **Cron-job friendly**
+
+## What's New in v0.2.1
+
+- **Header-driven rate-limit handling** — on a `429`, ByeSky reads the
+  `ratelimit-reset` / `ratelimit-policy` headers and waits out the **hourly**
+  limit (5,000/hr) automatically instead of dropping posts
+- **Resumable daily-limit exit** — on the **daily** limit (35,000/day) ByeSky
+  stops cleanly, reports what remains, and exits `75` (`EX_TEMPFAIL`); re-run to
+  continue where it left off
+- **Steadier default pacing** — `--delete-delay` default raised to `0.75 s`
+  (~4,800 deletes/hour) so the hourly ceiling is rarely reached
+- See [Rate Limiting](#rate-limiting) for the full details
 
 ## What's New in v0.2.0
 
@@ -152,9 +164,40 @@ For a self-hosted PDS, set `--pds https://your-pds.example.com`. Your handle and
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--delete-delay` | `0.5` | Seconds between deletions (rate-limit buffer) |
+| `--delete-delay` | `0.75` | Seconds between deletions (rate-limit buffer) |
 
-Bluesky's write rate limits are roughly 1,666 requests per 5 minutes. The default 0.5 s delay (~120 deletes/min) stays safely within that.
+Bluesky (and any AT Protocol PDS) meters writes with a **points system**, not a
+plain request count. Each operation costs points — `CREATE` = 3, `UPDATE` = 2,
+`DELETE` = 1 — against two rolling windows **per account**:
+
+| Window | Point limit | Deletes it allows |
+|--------|-------------|-------------------|
+| Hourly | 5,000 / hour  | 5,000 deletes/hour  |
+| Daily  | 35,000 / day  | 35,000 deletes/day  |
+
+These ceilings are enforced by the server and apply to every client — they are
+not something ByeSky (or any tool) can raise. When a limit is hit the PDS
+returns HTTP `429 RateLimitExceeded` along with `ratelimit-reset` (when the
+window reopens) and `ratelimit-policy` (which window, e.g. `5000;w=3600`).
+
+**How ByeSky handles it:**
+
+- **Steady pacing.** The default `--delete-delay 0.75` keeps a run at ~4,800
+  deletes/hour — just under the hourly ceiling — so the wall is rarely reached.
+- **Hourly limit → automatic wait.** If the hourly limit is hit anyway, ByeSky
+  reads the `ratelimit-reset` header, sleeps exactly until the window reopens,
+  and then resumes the same deletion. No posts are dropped.
+- **Daily limit → clean, resumable exit.** The 35,000/day ceiling can take up to
+  a full day to reset, so ByeSky does not block on it. Instead it stops, reports
+  how many posts remain, and exits with code `75` (`EX_TEMPFAIL`). **Just re-run
+  the same command after the window resets** — ByeSky re-scans and only targets
+  posts that still match, so anything already deleted is skipped automatically.
+- **Token refresh.** The atproto client refreshes the short-lived access token
+  automatically during long runs, so multi-hour deletions don't need re-login.
+
+If you have more than 35,000 old posts, full deletion simply spans multiple
+days — re-run ByeSky each day (a daily cron works well) until it reports nothing
+left to delete.
 
 ## Examples
 
@@ -251,6 +294,7 @@ All repository operations use your DID (resolved at login) rather than your hand
 | `1` | One or more deletions failed |
 | `2` | Safety check failed (e.g. `--days 0` with `--no-preview`) or login failed |
 | `3` | File I/O error |
+| `75` | Daily write rate limit reached — posts remain; re-run after it resets |
 | `99` | Unexpected error |
 
 ## Troubleshooting
@@ -286,7 +330,18 @@ python byesky.py --help
 
 ### Too many deletion failures
 
-Lower `--delete-delay` or increase it if you're hitting rate limits. Failures are retried up to 5 times with exponential back-off.
+Transient network failures are retried up to 5 times with exponential back-off.
+Rate-limit (`429`) responses are **not** counted as failures — ByeSky waits out
+the hourly limit automatically and exits cleanly on the daily limit (see
+[Rate Limiting](#rate-limiting)). If you still see failures, run with
+`--verbose` to inspect the underlying error.
+
+### Hit the daily rate limit (exit code 75)
+
+You have more posts to delete than the account-wide daily ceiling of 35,000
+allows in one day. This is expected for large accounts and is not an error —
+just re-run the same command after the window resets (a daily cron works well).
+ByeSky skips anything already deleted and continues with the rest.
 
 ## Security
 
